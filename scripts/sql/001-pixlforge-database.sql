@@ -45,7 +45,7 @@ go
     sqlcmd -S 192.168.1.128,1433 -U sa -P "<admin password>" -i 001-pixlforge-database.sql -v PixlForgeAppPassword="<strong password>"
 */
 
-if '$(PixlForgeAppPassword)' <> '' and '$(PixlForgeAppPassword)' not like '$(%'
+if '$(PixlForgeAppPassword)' <> ''
 begin
     declare @loginSql nvarchar(max);
 
