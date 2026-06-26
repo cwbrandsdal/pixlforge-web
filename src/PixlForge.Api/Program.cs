@@ -16,7 +16,10 @@ var workOs = WorkOsOptions.FromConfiguration(builder.Configuration);
 var dataRoot = builder.Configuration["PIXLFORGE_DATA_ROOT"] ?? Path.Combine(builder.Environment.ContentRootPath, "App_Data");
 
 builder.Services.AddOpenApi();
-builder.Services.AddHttpClient();
+builder.Services.AddHttpClient("openai", client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(8);
+});
 builder.Services.AddSingleton(new PixlForgeStore(dataRoot));
 builder.Services.AddCors(options =>
 {
@@ -182,22 +185,47 @@ api.MapPost("/generate", async (
     if (!string.IsNullOrWhiteSpace(settings.OpenAiFormat) && settings.OpenAiFormat != "png") body["output_format"] = settings.OpenAiFormat;
     if (!string.IsNullOrWhiteSpace(settings.OpenAiModeration) && settings.OpenAiModeration != "auto") body["moderation"] = settings.OpenAiModeration;
 
-    var client = httpClientFactory.CreateClient();
+    var client = httpClientFactory.CreateClient("openai");
     using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "https://api.openai.com/v1/images/generations");
     httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
     httpRequest.Content = new StringContent(JsonSerializer.Serialize(body, JsonDefaults.Options), Encoding.UTF8, "application/json");
 
-    using var response = await client.SendAsync(httpRequest);
+    HttpResponseMessage response;
+    try
+    {
+        response = await client.SendAsync(httpRequest);
+    }
+    catch (TaskCanceledException)
+    {
+        return Results.Problem(
+            title: "OpenAI image generation timed out.",
+            detail: "The image request took longer than 8 minutes. Try a lower image count, smaller size, or a faster model.",
+            statusCode: StatusCodes.Status504GatewayTimeout);
+    }
+    catch (HttpRequestException error)
+    {
+        return Results.Problem(
+            title: "OpenAI image generation request failed.",
+            detail: error.Message,
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+
+    using (response)
+    {
     var responseJson = await response.Content.ReadAsStringAsync();
     if (!response.IsSuccessStatusCode)
     {
-        throw new InvalidOperationException(ReadOpenAiError(responseJson, response.StatusCode));
+        return Results.Problem(
+            title: "OpenAI image generation failed.",
+            detail: ReadOpenAiError(responseJson, response.StatusCode),
+            statusCode: (int)response.StatusCode);
     }
 
     var openAiResponse = JsonSerializer.Deserialize<OpenAiImageResponse>(responseJson, JsonDefaults.Options)
         ?? new OpenAiImageResponse([]);
     var generations = await store.SaveOpenAiGenerations(userKey, project.Id, request.Prompt, settings, openAiResponse.Data);
     return Results.Ok(new GenerateResponse(generations));
+    }
 });
 
 api.MapPost("/upscale", async (ClaimsPrincipal user, PixlForgeStore store, UpscaleRequest request) =>
