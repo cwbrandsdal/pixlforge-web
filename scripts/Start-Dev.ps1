@@ -26,6 +26,7 @@ function Set-SecretEnv {
 Set-SecretEnv -SecretName "WorkOS.PixlForge.ClientId" -EnvironmentName "WORKOS_CLIENT_ID"
 Set-SecretEnv -SecretName "WorkOS.PixlForge.ApiKey" -EnvironmentName "WORKOS_API_KEY"
 Set-SecretEnv -SecretName "WorkOS.PixlForge.ApiHostname" -EnvironmentName "WORKOS_API_HOSTNAME" -Optional
+Set-SecretEnv -SecretName "PixlForge.Sql.ConnectionString" -EnvironmentName "PIXLFORGE_SQL_CONNECTION" -Optional
 
 $env:ASPNETCORE_URLS = "https://localhost:$ApiPort"
 

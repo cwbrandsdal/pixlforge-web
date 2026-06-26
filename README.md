@@ -15,6 +15,7 @@ The app expects runtime environment variables. On this Windows machine, use Secr
 - `WorkOS.PixlForge.ClientId`
 - `WorkOS.PixlForge.ApiKey`
 - `WorkOS.PixlForge.ApiHostname` optional, defaults to `api.workos.com`
+- `PixlForge.Sql.ConnectionString` optional, enables SQL Server persistence for user state and saved OpenAI API keys.
 
 The local helper reads those names and sets process-only environment variables:
 
@@ -41,3 +42,9 @@ The frontend runs on `http://localhost:5173` and proxies API calls to the .NET b
 ```
 
 Output is written to `publish\pixlforge-web`. Deploying that output to Coruscant and writing GoDaddy DNS are guarded infrastructure operations.
+
+## Persistence
+
+PixlForge stores generated image/reference files under `PIXLFORGE_DATA_ROOT`. Production defaults to `/var/lib/pixlforge-web`, outside the deploy directory, so files survive app publishes.
+
+When `PIXLFORGE_SQL_CONNECTION` is set, user settings, projects, generation history, and saved OpenAI API keys are persisted in SQL Server. File storage remains on `PIXLFORGE_DATA_ROOT` for image and reference binaries. If SQL is not configured, the app falls back to the local JSON file store under the data root.

@@ -7,20 +7,21 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.SqlClient;
 using Microsoft.IdentityModel.Tokens;
 using SkiaSharp;
 
 var builder = WebApplication.CreateBuilder(args);
 
 var workOs = WorkOsOptions.FromConfiguration(builder.Configuration);
-var dataRoot = builder.Configuration["PIXLFORGE_DATA_ROOT"] ?? Path.Combine(builder.Environment.ContentRootPath, "App_Data");
+var persistence = PixlForgePersistenceOptions.FromConfiguration(builder.Configuration, builder.Environment);
 
 builder.Services.AddOpenApi();
 builder.Services.AddHttpClient("openai", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(8);
 });
-builder.Services.AddSingleton(new PixlForgeStore(dataRoot));
+builder.Services.AddSingleton(new PixlForgeStore(persistence.DataRoot, persistence.SqlConnectionString));
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("dev", policy =>
@@ -294,15 +295,40 @@ static string ReadOpenAiError(string json, System.Net.HttpStatusCode statusCode)
     }
 }
 
-sealed class PixlForgeStore(string dataRoot)
+sealed class PixlForgeStore
 {
-    private readonly string dataRoot = dataRoot;
+    private readonly string dataRoot;
+    private readonly SqlStateStore? sql;
+
+    public PixlForgeStore(string dataRoot, string sqlConnectionString)
+    {
+        this.dataRoot = dataRoot;
+        Directory.CreateDirectory(dataRoot);
+        sql = string.IsNullOrWhiteSpace(sqlConnectionString) ? null : new SqlStateStore(sqlConnectionString);
+    }
 
     public async Task<PixlForgeState> Load(string userKey)
     {
         var root = UserRoot(userKey);
         Directory.CreateDirectory(root);
         var statePath = StatePath(userKey);
+        if (sql is not null)
+        {
+            var sqlState = await sql.LoadState(userKey);
+            if (sqlState is not null) return NormalizeLoadedState(sqlState, userKey);
+
+            if (File.Exists(statePath))
+            {
+                var migrated = await LoadFileState(userKey, statePath);
+                await sql.SaveState(userKey, migrated);
+                return migrated;
+            }
+
+            var created = DefaultState(userKey);
+            await sql.SaveState(userKey, created);
+            return created;
+        }
+
         if (!File.Exists(statePath))
         {
             var state = DefaultState(userKey);
@@ -310,8 +336,18 @@ sealed class PixlForgeStore(string dataRoot)
             return state;
         }
 
+        return await LoadFileState(userKey, statePath);
+    }
+
+    private async Task<PixlForgeState> LoadFileState(string userKey, string statePath)
+    {
         await using var stream = File.OpenRead(statePath);
         var loaded = await JsonSerializer.DeserializeAsync<PixlForgeState>(stream, JsonDefaults.Options) ?? DefaultState(userKey);
+        return NormalizeLoadedState(loaded, userKey);
+    }
+
+    private PixlForgeState NormalizeLoadedState(PixlForgeState loaded, string userKey)
+    {
         loaded.Settings = NormalizeSettings(loaded.Settings);
         if (loaded.Projects.Count == 0) loaded.Projects.Add(DefaultProject(userKey, loaded.Settings));
         if (!loaded.Projects.Any(project => project.Id == loaded.ActiveProjectId)) loaded.ActiveProjectId = loaded.Projects[0].Id;
@@ -321,6 +357,12 @@ sealed class PixlForgeStore(string dataRoot)
     public async Task Save(string userKey, PixlForgeState state)
     {
         Directory.CreateDirectory(UserRoot(userKey));
+        if (sql is not null)
+        {
+            await sql.SaveState(userKey, state);
+            return;
+        }
+
         await using var stream = File.Create(StatePath(userKey));
         await JsonSerializer.SerializeAsync(stream, state, JsonDefaults.Options);
     }
@@ -546,27 +588,47 @@ sealed class PixlForgeStore(string dataRoot)
     public async Task<SecretStatus> GetSecretStatus(string userKey)
     {
         var envKey = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OPENAI_API_KEY"));
-        return new SecretStatus(File.Exists(OpenAiKeyPath(userKey)), envKey);
+        var saved = sql is not null
+            ? !string.IsNullOrWhiteSpace(await sql.LoadSecret(userKey, "openai-api-key")) || File.Exists(OpenAiKeyPath(userKey))
+            : File.Exists(OpenAiKeyPath(userKey));
+        return new SecretStatus(saved, envKey);
     }
 
     public async Task<string> GetOpenAiApiKey(string userKey)
     {
         var envKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
         if (!string.IsNullOrWhiteSpace(envKey)) return envKey.Trim();
+        if (sql is not null)
+        {
+            var saved = await sql.LoadSecret(userKey, "openai-api-key");
+            if (!string.IsNullOrWhiteSpace(saved)) return saved.Trim();
+        }
+
         var path = OpenAiKeyPath(userKey);
-        return File.Exists(path) ? (await File.ReadAllTextAsync(path)).Trim() : "";
+        var fileKey = File.Exists(path) ? (await File.ReadAllTextAsync(path)).Trim() : "";
+        if (!string.IsNullOrWhiteSpace(fileKey) && sql is not null) await sql.SaveSecret(userKey, "openai-api-key", fileKey);
+        return fileKey;
     }
 
     public async Task<SecretStatus> SaveOpenAiApiKey(string userKey, string apiKey)
     {
         Directory.CreateDirectory(UserRoot(userKey));
         if (string.IsNullOrWhiteSpace(apiKey)) return await ClearOpenAiApiKey(userKey);
+        if (sql is not null)
+        {
+            await sql.SaveSecret(userKey, "openai-api-key", apiKey.Trim());
+            var filePath = OpenAiKeyPath(userKey);
+            if (File.Exists(filePath)) File.Delete(filePath);
+            return await GetSecretStatus(userKey);
+        }
+
         await File.WriteAllTextAsync(OpenAiKeyPath(userKey), apiKey.Trim());
         return await GetSecretStatus(userKey);
     }
 
     public async Task<SecretStatus> ClearOpenAiApiKey(string userKey)
     {
+        if (sql is not null) await sql.DeleteSecret(userKey, "openai-api-key");
         var path = OpenAiKeyPath(userKey);
         if (File.Exists(path)) File.Delete(path);
         return await GetSecretStatus(userKey);
@@ -613,6 +675,7 @@ sealed class PixlForgeStore(string dataRoot)
     {
         var fullPath = Path.GetFullPath(path);
         var id = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(fullPath))).ToLowerInvariant();
+        Directory.CreateDirectory(dataRoot);
         File.WriteAllText(Path.Combine(dataRoot, $"{id}.asset"), fullPath);
         return id;
     }
@@ -691,6 +754,158 @@ sealed record WorkOsOptions(string ClientId, string ApiKey, string ApiHostname)
             configuration["WORKOS_CLIENT_ID"] ?? "",
             configuration["WORKOS_API_KEY"] ?? "",
             configuration["WORKOS_API_HOSTNAME"] ?? "api.workos.com");
+}
+
+sealed record PixlForgePersistenceOptions(string DataRoot, string SqlConnectionString)
+{
+    public static PixlForgePersistenceOptions FromConfiguration(IConfiguration configuration, IHostEnvironment environment)
+    {
+        var dataRoot = configuration["PIXLFORGE_DATA_ROOT"]
+            ?? (environment.IsProduction()
+                ? "/var/lib/pixlforge-web"
+                : Path.Combine(environment.ContentRootPath, "App_Data"));
+
+        return new PixlForgePersistenceOptions(
+            dataRoot,
+            configuration["PIXLFORGE_SQL_CONNECTION"] ?? "");
+    }
+}
+
+sealed class SqlStateStore(string connectionString)
+{
+    private readonly SemaphoreSlim schemaGate = new(1, 1);
+    private bool schemaReady;
+
+    public async Task<PixlForgeState?> LoadState(string userKey)
+    {
+        await EnsureSchema();
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "select StateJson from dbo.PixlForgeUserState where UserKey = @UserKey;";
+        command.Parameters.AddWithValue("@UserKey", userKey);
+        var value = await command.ExecuteScalarAsync();
+        return value is string json
+            ? JsonSerializer.Deserialize<PixlForgeState>(json, JsonDefaults.Options)
+            : null;
+    }
+
+    public async Task SaveState(string userKey, PixlForgeState state)
+    {
+        await EnsureSchema();
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            set xact_abort on;
+            begin transaction;
+            update dbo.PixlForgeUserState
+            set StateJson = @StateJson, UpdatedAt = sysdatetimeoffset()
+            where UserKey = @UserKey;
+            if @@rowcount = 0
+                insert into dbo.PixlForgeUserState (UserKey, StateJson) values (@UserKey, @StateJson);
+            commit transaction;
+            """;
+        command.Parameters.AddWithValue("@UserKey", userKey);
+        command.Parameters.AddWithValue("@StateJson", JsonSerializer.Serialize(state, JsonDefaults.Options));
+        await command.ExecuteNonQueryAsync();
+    }
+
+    public async Task<string> LoadSecret(string userKey, string secretName)
+    {
+        await EnsureSchema();
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            select SecretValue
+            from dbo.PixlForgeSecrets
+            where UserKey = @UserKey and SecretName = @SecretName;
+            """;
+        command.Parameters.AddWithValue("@UserKey", userKey);
+        command.Parameters.AddWithValue("@SecretName", secretName);
+        var value = await command.ExecuteScalarAsync();
+        return value as string ?? "";
+    }
+
+    public async Task SaveSecret(string userKey, string secretName, string secretValue)
+    {
+        await EnsureSchema();
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            set xact_abort on;
+            begin transaction;
+            update dbo.PixlForgeSecrets
+            set SecretValue = @SecretValue, UpdatedAt = sysdatetimeoffset()
+            where UserKey = @UserKey and SecretName = @SecretName;
+            if @@rowcount = 0
+                insert into dbo.PixlForgeSecrets (UserKey, SecretName, SecretValue) values (@UserKey, @SecretName, @SecretValue);
+            commit transaction;
+            """;
+        command.Parameters.AddWithValue("@UserKey", userKey);
+        command.Parameters.AddWithValue("@SecretName", secretName);
+        command.Parameters.AddWithValue("@SecretValue", secretValue);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    public async Task DeleteSecret(string userKey, string secretName)
+    {
+        await EnsureSchema();
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            delete from dbo.PixlForgeSecrets
+            where UserKey = @UserKey and SecretName = @SecretName;
+            """;
+        command.Parameters.AddWithValue("@UserKey", userKey);
+        command.Parameters.AddWithValue("@SecretName", secretName);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private async Task EnsureSchema()
+    {
+        if (schemaReady) return;
+        await schemaGate.WaitAsync();
+        try
+        {
+            if (schemaReady) return;
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                if object_id(N'dbo.PixlForgeUserState', N'U') is null
+                begin
+                    create table dbo.PixlForgeUserState
+                    (
+                        UserKey nvarchar(256) not null constraint PK_PixlForgeUserState primary key,
+                        StateJson nvarchar(max) not null,
+                        UpdatedAt datetimeoffset not null constraint DF_PixlForgeUserState_UpdatedAt default sysdatetimeoffset()
+                    );
+                end;
+
+                if object_id(N'dbo.PixlForgeSecrets', N'U') is null
+                begin
+                    create table dbo.PixlForgeSecrets
+                    (
+                        UserKey nvarchar(256) not null,
+                        SecretName nvarchar(128) not null,
+                        SecretValue nvarchar(max) not null,
+                        UpdatedAt datetimeoffset not null constraint DF_PixlForgeSecrets_UpdatedAt default sysdatetimeoffset(),
+                        constraint PK_PixlForgeSecrets primary key (UserKey, SecretName)
+                    );
+                end;
+                """;
+            await command.ExecuteNonQueryAsync();
+            schemaReady = true;
+        }
+        finally
+        {
+            schemaGate.Release();
+        }
+    }
 }
 
 static class WorkOsJwksCache
