@@ -46,10 +46,15 @@ go
 */
 
 if '$(PixlForgeAppPassword)' <> '' and '$(PixlForgeAppPassword)' not like '$(%'
-    and not exists (select 1 from sys.sql_logins where name = N'pixlforge_app')
 begin
-    declare @loginSql nvarchar(max) = N'create login pixlforge_app with password = '
-        + quotename('$(PixlForgeAppPassword)', '''') + N', check_policy = on;';
+    declare @loginSql nvarchar(max);
+
+    if exists (select 1 from sys.sql_logins where name = N'pixlforge_app')
+        set @loginSql = N'alter login pixlforge_app with password = ' + quotename('$(PixlForgeAppPassword)', '''') + N';';
+    else
+        set @loginSql = N'create login pixlforge_app with password = '
+            + quotename('$(PixlForgeAppPassword)', '''') + N', check_policy = on;';
+
     exec sys.sp_executesql @loginSql;
 end;
 go
