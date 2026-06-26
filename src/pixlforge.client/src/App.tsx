@@ -100,6 +100,14 @@ function Workspace() {
     if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
     const response = await fetch(path, { ...init, headers });
     if (!response.ok) {
+      if (response.status === 401) {
+        const debug = await fetch("/api/auth/debug", { headers: { Authorization: `Bearer ${token}` } })
+          .then((debugResponse) => debugResponse.ok ? debugResponse.json() : null)
+          .catch(() => null);
+        if (debug) {
+          throw new Error(`Request failed: 401 ${JSON.stringify(debug)}`);
+        }
+      }
       const text = await response.text();
       throw new Error(text || `Request failed: ${response.status}`);
     }

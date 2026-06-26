@@ -3,6 +3,7 @@ using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -43,6 +44,15 @@ if (workOs.IsConfigured)
                 ValidateIssuerSigningKey = true,
                 IssuerSigningKeyResolver = WorkOsJwksCache.ResolveSigningKeys(workOs.JwksUri)
             };
+            options.Events = new JwtBearerEvents
+            {
+                OnAuthenticationFailed = context =>
+                {
+                    var logger = context.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("WorkOSJwt");
+                    logger.LogWarning(context.Exception, "WorkOS JWT validation failed.");
+                    return Task.CompletedTask;
+                }
+            };
         });
 
     builder.Services.AddAuthorization();
@@ -78,6 +88,28 @@ app.MapGet("/api/auth/config", () => Results.Ok(new
     clientId = workOs.ClientId,
     apiHostname = workOs.ApiHostname
 }));
+
+app.MapGet("/api/auth/debug", (HttpContext context) =>
+{
+    var header = context.Request.Headers.Authorization.ToString();
+    var token = header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? header["Bearer ".Length..].Trim() : "";
+    if (string.IsNullOrWhiteSpace(token)) return Results.Ok(new { hasBearer = false });
+
+    var parts = token.Split('.');
+    if (parts.Length < 2) return Results.Ok(new { hasBearer = true, jwtLike = false });
+
+    var jwtHeader = DecodeJwtPart(parts[0]);
+    var jwtPayload = DecodeJwtPart(parts[1]);
+    return Results.Ok(new
+    {
+        hasBearer = true,
+        jwtLike = true,
+        header = PickJwtFields(jwtHeader, ["alg", "kid", "typ"]),
+        claims = PickJwtFields(jwtPayload, ["iss", "aud", "azp", "sub", "sid", "org_id", "role", "exp", "iat"]),
+        expectedIssuers = new[] { "https://api.workos.com/", "https://api.workos.com" },
+        jwks = workOs.JwksUri
+    });
+});
 
 app.MapGet("/api/health", () => Results.Ok(new
 {
@@ -188,6 +220,23 @@ static string UserKey(ClaimsPrincipal user)
     var id = user.FindFirstValue(ClaimTypes.NameIdentifier) ?? user.FindFirstValue("sub") ?? "anonymous";
     return Convert.ToHexString(Encoding.UTF8.GetBytes(id)).ToLowerInvariant();
 }
+
+static Dictionary<string, object?> DecodeJwtPart(string value)
+{
+    try
+    {
+        var padded = value.Replace('-', '+').Replace('_', '/');
+        padded = padded.PadRight(padded.Length + (4 - padded.Length % 4) % 4, '=');
+        return JsonSerializer.Deserialize<Dictionary<string, object?>>(Encoding.UTF8.GetString(Convert.FromBase64String(padded)), JsonDefaults.Options) ?? [];
+    }
+    catch
+    {
+        return [];
+    }
+}
+
+static Dictionary<string, object?> PickJwtFields(Dictionary<string, object?> source, string[] fields) =>
+    fields.Where(source.ContainsKey).ToDictionary(field => field, field => source[field]);
 
 static string NormalizeOpenAiSize(string size, string aspectRatio)
 {
