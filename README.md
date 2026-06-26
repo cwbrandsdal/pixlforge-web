@@ -16,6 +16,8 @@ The app expects runtime environment variables. On this Windows machine, use Secr
 - `WorkOS.PixlForge.ApiKey`
 - `WorkOS.PixlForge.ApiHostname` optional, defaults to `api.workos.com`
 - `PixlForge.Sql.ConnectionString` optional, enables SQL Server persistence for user state and saved OpenAI API keys.
+- `PixlForge.AzureBlob.ConnectionString` optional, enables Azure Blob Storage for uploaded prompt files, references, generated images, and upscaled outputs.
+- `PixlForge.AzureBlob.Container` optional, defaults to `pixlforge`.
 
 The local helper reads those names and sets process-only environment variables:
 
@@ -48,3 +50,25 @@ Output is written to `publish\pixlforge-web`. Deploying that output to Coruscant
 PixlForge stores generated image/reference files under `PIXLFORGE_DATA_ROOT`. Production defaults to `/var/lib/pixlforge-web`, outside the deploy directory, so files survive app publishes.
 
 When `PIXLFORGE_SQL_CONNECTION` is set, user settings, projects, generation history, and saved OpenAI API keys are persisted in SQL Server. File storage remains on `PIXLFORGE_DATA_ROOT` for image and reference binaries. If SQL is not configured, the app falls back to the local JSON file store under the data root.
+
+When `PIXLFORGE_AZURE_BLOB_CONNECTION` is set, new uploaded prompt/reference files and generated images are stored in Azure Blob Storage instead of the local data root. SQL Server remains the metadata store. Existing local assets continue to resolve from `PIXLFORGE_DATA_ROOT`.
+
+## Azure Blob Setup
+
+Create these Azure resources:
+
+- Resource group: any existing group is fine, or create `rg-pixlforge-prod`.
+- Storage account: globally unique name, for example `pixlforgeprod`.
+- Blob container: `pixlforge`.
+- Public access: disabled/private container.
+- Access tier: Hot for active generation work. Azure lifecycle rules can move old blobs to Cool or Archive later.
+- Redundancy: LRS is acceptable for low-cost single-region use; choose ZRS/GRS if regional resilience matters more.
+
+Store the storage connection string locally with:
+
+```powershell
+Set-Secret -Name PixlForge.AzureBlob.ConnectionString
+Set-Secret -Name PixlForge.AzureBlob.Container -Secret pixlforge
+```
+
+For Coruscant, set `PIXLFORGE_AZURE_BLOB_CONNECTION` and `PIXLFORGE_AZURE_BLOB_CONTAINER` in `/etc/pixlforge-web/pixlforge-web.env`, without committing the connection string.

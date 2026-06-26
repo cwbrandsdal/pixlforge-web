@@ -3,6 +3,8 @@ using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
@@ -21,7 +23,11 @@ builder.Services.AddHttpClient("openai", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(8);
 });
-builder.Services.AddSingleton(new PixlForgeStore(persistence.DataRoot, persistence.SqlConnectionString));
+builder.Services.AddSingleton(new PixlForgeStore(
+    persistence.DataRoot,
+    persistence.SqlConnectionString,
+    persistence.AzureBlobConnectionString,
+    persistence.AzureBlobContainer));
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("dev", policy =>
@@ -241,8 +247,8 @@ api.MapDelete("/generations/{generationId}", async (ClaimsPrincipal user, PixlFo
 app.MapGet("/api/assets/{assetId}", async (PixlForgeStore store, string assetId) =>
 {
     var asset = await store.ResolveAsset(assetId);
-    if (asset is null || !File.Exists(asset.Path)) return Results.NotFound();
-    return Results.File(asset.Path, asset.ContentType);
+    if (asset is null) return Results.NotFound();
+    return Results.File(asset.Stream, asset.ContentType);
 });
 
 app.MapFallbackToFile("index.html");
@@ -299,12 +305,18 @@ sealed class PixlForgeStore
 {
     private readonly string dataRoot;
     private readonly SqlStateStore? sql;
+    private readonly BlobContainerClient? blobContainer;
 
-    public PixlForgeStore(string dataRoot, string sqlConnectionString)
+    public PixlForgeStore(string dataRoot, string sqlConnectionString, string azureBlobConnectionString, string azureBlobContainer)
     {
         this.dataRoot = dataRoot;
         Directory.CreateDirectory(dataRoot);
         sql = string.IsNullOrWhiteSpace(sqlConnectionString) ? null : new SqlStateStore(sqlConnectionString);
+        if (!string.IsNullOrWhiteSpace(azureBlobConnectionString) && !string.IsNullOrWhiteSpace(azureBlobContainer))
+        {
+            blobContainer = new BlobContainerClient(azureBlobConnectionString, azureBlobContainer);
+            blobContainer.CreateIfNotExists(PublicAccessType.None);
+        }
     }
 
     public async Task<PixlForgeState> Load(string userKey)
@@ -428,17 +440,30 @@ sealed class PixlForgeStore
             var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
             var id = Guid.NewGuid().ToString("n");
             var fileName = $"{PixlForgeHelpers.Slug(Path.GetFileNameWithoutExtension(file.FileName))}-{id[..8]}{extension}";
-            var target = Path.Combine(referenceRoot, fileName);
-            await using (var stream = File.Create(target))
+            var contentType = string.IsNullOrWhiteSpace(file.ContentType) ? PixlForgeHelpers.ContentType(fileName) : file.ContentType;
+            string assetId;
+            if (blobContainer is not null)
             {
-                await file.CopyToAsync(stream);
+                var blobName = BlobName(userKey, projectId, "uploads", id, fileName);
+                await using var stream = file.OpenReadStream();
+                assetId = await SaveBlobAsset(blobName, stream, contentType);
+            }
+            else
+            {
+                var target = Path.Combine(referenceRoot, fileName);
+                await using (var stream = File.Create(target))
+                {
+                    await file.CopyToAsync(stream);
+                }
+
+                assetId = AssetId(target);
             }
 
             project.References.Insert(0, new ReferenceFile(
                 id,
                 Path.GetFileName(file.FileName),
-                AssetId(target),
-                file.ContentType,
+                assetId,
+                contentType,
                 file.Length,
                 DateTimeOffset.UtcNow));
         }
@@ -456,8 +481,7 @@ sealed class PixlForgeStore
         var reference = project.References.FirstOrDefault(candidate => candidate.Id == referenceId);
         if (reference is not null)
         {
-            var path = AssetPath(reference.AssetId);
-            if (path is not null && File.Exists(path)) File.Delete(path);
+            await DeleteAsset(reference.AssetId);
         }
         project.References = project.References.Where(candidate => candidate.Id != referenceId).ToList();
         await Save(userKey, state);
@@ -469,15 +493,14 @@ sealed class PixlForgeStore
         var snippets = new List<string>();
         foreach (var reference in project.References.Take(12))
         {
-            var path = AssetPath(reference.AssetId);
-            if (path is null || !File.Exists(path)) continue;
             if (!reference.ContentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase) &&
-                !new[] { ".txt", ".md", ".json", ".csv", ".svg", ".html", ".xml", ".yaml", ".yml" }.Contains(Path.GetExtension(path).ToLowerInvariant()))
+                !new[] { ".txt", ".md", ".json", ".csv", ".svg", ".html", ".xml", ".yaml", ".yml" }.Contains(Path.GetExtension(reference.Name).ToLowerInvariant()))
             {
                 continue;
             }
 
-            var text = await File.ReadAllTextAsync(path);
+            var text = await ReadAssetText(reference.AssetId);
+            if (string.IsNullOrWhiteSpace(text)) continue;
             if (text.Length > 2500) text = text[..2500] + "\n[truncated]";
             snippets.Add($"{reference.Name}:\n{text}");
         }
@@ -500,8 +523,9 @@ sealed class PixlForgeStore
                 ? Convert.FromBase64String(item.B64Json)
                 : await DownloadImage(item.Url);
             var extension = settings.OpenAiFormat == "jpeg" ? ".jpg" : settings.OpenAiFormat == "webp" ? ".webp" : ".png";
-            var path = Path.Combine(outputRoot, $"{PixlForgeHelpers.Slug(prompt)}-{index + 1}{extension}");
-            await File.WriteAllBytesAsync(path, bytes);
+            var fileName = $"{PixlForgeHelpers.Slug(prompt)}-{index + 1}{extension}";
+            var contentType = PixlForgeHelpers.ContentType(fileName);
+            var assetId = await SaveBytesAsset(userKey, projectId, "generations", batchId, fileName, bytes, contentType, outputRoot);
             created.Add(new ImageGeneration(
                 Guid.NewGuid().ToString("n"),
                 projectId,
@@ -509,7 +533,7 @@ sealed class PixlForgeStore
                 "openai",
                 "draft",
                 "",
-                AssetId(path),
+                assetId,
                 "completed",
                 "",
                 DateTimeOffset.UtcNow,
@@ -538,17 +562,21 @@ sealed class PixlForgeStore
         for (var index = 0; index < selected.Count; index++)
         {
             var source = selected[index];
-            var sourcePath = AssetPath(source.AssetId) ?? "";
-            if (!File.Exists(sourcePath)) continue;
-            using var image = SKBitmap.Decode(sourcePath);
+            await using var sourceStream = await OpenAssetStream(source.AssetId);
+            if (sourceStream is null) continue;
+            using var image = SKBitmap.Decode(sourceStream);
             if (image is null) continue;
             var target = Get4kTarget(image.Width, image.Height);
-            var outputPath = Path.Combine(outputRoot, $"{Path.GetFileNameWithoutExtension(sourcePath)}-4k-{index + 1}.png");
+            var fileName = $"{PixlForgeHelpers.Slug(source.Prompt)}-4k-{index + 1}.png";
+            var outputPath = Path.Combine(outputRoot, fileName);
             using var scaled = image.Resize(new SKImageInfo(target.Width, target.Height), SKSamplingOptions.Default);
             if (scaled is null) continue;
             using var skImage = SKImage.FromBitmap(scaled);
-            await using var output = File.Create(outputPath);
-            skImage.Encode(SKEncodedImageFormat.Png, 95).SaveTo(output);
+            using var encoded = skImage.Encode(SKEncodedImageFormat.Png, 95);
+            await using var memory = new MemoryStream();
+            encoded.SaveTo(memory);
+            var bytes = memory.ToArray();
+            var assetId = await SaveBytesAsset(userKey, projectId, "upscaled", batchId, fileName, bytes, "image/png", outputRoot);
             results.Add(new ImageGeneration(
                 Guid.NewGuid().ToString("n"),
                 projectId,
@@ -556,7 +584,7 @@ sealed class PixlForgeStore
                 "local",
                 "final",
                 source.Id,
-                AssetId(outputPath),
+                assetId,
                 "completed",
                 "",
                 DateTimeOffset.UtcNow,
@@ -577,8 +605,7 @@ sealed class PixlForgeStore
         var generation = state.Generations.FirstOrDefault(candidate => candidate.Id == generationId);
         if (generation is not null)
         {
-            var path = AssetPath(generation.AssetId);
-            if (path is not null && File.Exists(path)) File.Delete(path);
+            await DeleteAsset(generation.AssetId);
         }
         state.Generations = state.Generations.Where(candidate => candidate.Id != generationId).ToList();
         await Save(userKey, state);
@@ -634,11 +661,19 @@ sealed class PixlForgeStore
         return await GetSecretStatus(userKey);
     }
 
-    public Task<ResolvedAsset?> ResolveAsset(string assetId)
+    public async Task<ResolvedAsset?> ResolveAsset(string assetId)
     {
+        if (TryGetBlobName(assetId, out var blobName) && blobContainer is not null)
+        {
+            var blob = blobContainer.GetBlobClient(blobName);
+            if (!await blob.ExistsAsync()) return null;
+            var properties = await blob.GetPropertiesAsync();
+            return new ResolvedAsset(await blob.OpenReadAsync(), properties.Value.ContentType);
+        }
+
         var path = AssetPath(assetId);
-        if (path is null || !Path.GetFullPath(path).StartsWith(Path.GetFullPath(dataRoot))) return Task.FromResult<ResolvedAsset?>(null);
-        return Task.FromResult<ResolvedAsset?>(new ResolvedAsset(path, PixlForgeHelpers.ContentType(path)));
+        if (path is null || !Path.GetFullPath(path).StartsWith(Path.GetFullPath(dataRoot)) || !File.Exists(path)) return null;
+        return new ResolvedAsset(File.OpenRead(path), PixlForgeHelpers.ContentType(path));
     }
 
     private PixlForgeState DefaultState(string userKey)
@@ -684,6 +719,95 @@ sealed class PixlForgeStore
     {
         var map = Path.Combine(dataRoot, $"{assetId}.asset");
         return File.Exists(map) ? File.ReadAllText(map) : null;
+    }
+
+    private async Task<string> SaveBytesAsset(string userKey, string projectId, string category, string groupId, string fileName, byte[] bytes, string contentType, string localRoot)
+    {
+        if (blobContainer is not null)
+        {
+            var blobName = BlobName(userKey, projectId, category, groupId, fileName);
+            await using var stream = new MemoryStream(bytes);
+            return await SaveBlobAsset(blobName, stream, contentType);
+        }
+
+        Directory.CreateDirectory(localRoot);
+        var path = Path.Combine(localRoot, fileName);
+        await File.WriteAllBytesAsync(path, bytes);
+        return AssetId(path);
+    }
+
+    private async Task<string> SaveBlobAsset(string blobName, Stream stream, string contentType)
+    {
+        var blob = blobContainer!.GetBlobClient(blobName);
+        await blob.UploadAsync(stream, new BlobUploadOptions
+        {
+            HttpHeaders = new BlobHttpHeaders { ContentType = contentType }
+        });
+        return BlobAssetId(blobName);
+    }
+
+    private async Task<string> ReadAssetText(string assetId)
+    {
+        await using var stream = await OpenAssetStream(assetId);
+        if (stream is null) return "";
+        using var reader = new StreamReader(stream, Encoding.UTF8, true);
+        return await reader.ReadToEndAsync();
+    }
+
+    private async Task<Stream?> OpenAssetStream(string assetId)
+    {
+        if (TryGetBlobName(assetId, out var blobName) && blobContainer is not null)
+        {
+            var blob = blobContainer.GetBlobClient(blobName);
+            return await blob.ExistsAsync() ? await blob.OpenReadAsync() : null;
+        }
+
+        var path = AssetPath(assetId);
+        if (path is null || !Path.GetFullPath(path).StartsWith(Path.GetFullPath(dataRoot)) || !File.Exists(path)) return null;
+        return File.OpenRead(path);
+    }
+
+    private async Task DeleteAsset(string assetId)
+    {
+        if (TryGetBlobName(assetId, out var blobName) && blobContainer is not null)
+        {
+            await blobContainer.DeleteBlobIfExistsAsync(blobName);
+            return;
+        }
+
+        var path = AssetPath(assetId);
+        if (path is not null && File.Exists(path)) File.Delete(path);
+    }
+
+    private static string BlobName(string userKey, string projectId, string category, string groupId, string fileName) =>
+        string.Join('/', [
+            "users",
+            PixlForgeHelpers.Slug(userKey),
+            "projects",
+            PixlForgeHelpers.Slug(projectId),
+            PixlForgeHelpers.Slug(category),
+            PixlForgeHelpers.Slug(groupId),
+            PixlForgeHelpers.Slug(Path.GetFileNameWithoutExtension(fileName)) + Path.GetExtension(fileName).ToLowerInvariant()
+        ]);
+
+    private static string BlobAssetId(string blobName) =>
+        "az-" + Convert.ToBase64String(Encoding.UTF8.GetBytes(blobName)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    private static bool TryGetBlobName(string assetId, out string blobName)
+    {
+        blobName = "";
+        if (!assetId.StartsWith("az-", StringComparison.OrdinalIgnoreCase)) return false;
+        try
+        {
+            var encoded = assetId[3..].Replace('-', '+').Replace('_', '/');
+            encoded = encoded.PadRight(encoded.Length + (4 - encoded.Length % 4) % 4, '=');
+            blobName = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
+            return !string.IsNullOrWhiteSpace(blobName);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static (int Width, int Height) Get4kTarget(int width, int height)
@@ -756,7 +880,7 @@ sealed record WorkOsOptions(string ClientId, string ApiKey, string ApiHostname)
             configuration["WORKOS_API_HOSTNAME"] ?? "api.workos.com");
 }
 
-sealed record PixlForgePersistenceOptions(string DataRoot, string SqlConnectionString)
+sealed record PixlForgePersistenceOptions(string DataRoot, string SqlConnectionString, string AzureBlobConnectionString, string AzureBlobContainer)
 {
     public static PixlForgePersistenceOptions FromConfiguration(IConfiguration configuration, IHostEnvironment environment)
     {
@@ -767,7 +891,9 @@ sealed record PixlForgePersistenceOptions(string DataRoot, string SqlConnectionS
 
         return new PixlForgePersistenceOptions(
             dataRoot,
-            configuration["PIXLFORGE_SQL_CONNECTION"] ?? "");
+            configuration["PIXLFORGE_SQL_CONNECTION"] ?? "",
+            configuration["PIXLFORGE_AZURE_BLOB_CONNECTION"] ?? "",
+            configuration["PIXLFORGE_AZURE_BLOB_CONTAINER"] ?? "pixlforge");
     }
 }
 
@@ -962,7 +1088,7 @@ sealed record SaveOpenAiKeyRequest(string ApiKey);
 sealed record GenerateRequest(string ProjectId, string Prompt, PixlForgeSettings Settings);
 sealed record UpscaleRequest(string ProjectId, List<string> GenerationIds);
 sealed record GenerateResponse(List<ImageGeneration> Generations);
-sealed record ResolvedAsset(string Path, string ContentType);
+sealed record ResolvedAsset(Stream Stream, string ContentType);
 sealed record OpenAiImageResponse(List<OpenAiImageData> Data);
 sealed record OpenAiImageData([property: JsonPropertyName("b64_json")] string? B64Json, string? Url);
 sealed record OpenAiErrorResponse(OpenAiError? Error);
