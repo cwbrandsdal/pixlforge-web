@@ -38,7 +38,11 @@ if (workOs.IsConfigured)
             options.TokenValidationParameters = new TokenValidationParameters
             {
                 ValidateIssuer = true,
-                ValidIssuers = ["https://api.workos.com/", "https://api.workos.com"],
+                ValidIssuers = [
+                    "https://api.workos.com/",
+                    "https://api.workos.com",
+                    $"https://api.workos.com/user_management/{workOs.ClientId}"
+                ],
                 ValidateAudience = false,
                 ValidateLifetime = true,
                 ValidateIssuerSigningKey = true,
