@@ -173,9 +173,9 @@ api.MapPost("/upscale", async (ClaimsPrincipal user, PixlForgeStore store, Upsca
 api.MapDelete("/generations/{generationId}", async (ClaimsPrincipal user, PixlForgeStore store, string generationId) =>
     Results.Ok(await store.DeleteGeneration(UserKey(user), generationId)));
 
-api.MapGet("/assets/{assetId}", async (ClaimsPrincipal user, PixlForgeStore store, string assetId) =>
+app.MapGet("/api/assets/{assetId}", async (PixlForgeStore store, string assetId) =>
 {
-    var asset = await store.ResolveAsset(UserKey(user), assetId);
+    var asset = await store.ResolveAsset(assetId);
     if (asset is null || !File.Exists(asset.Path)) return Results.NotFound();
     return Results.File(asset.Path, asset.ContentType);
 });
@@ -491,10 +491,10 @@ sealed class PixlForgeStore(string dataRoot)
         return await GetSecretStatus(userKey);
     }
 
-    public Task<ResolvedAsset?> ResolveAsset(string userKey, string assetId)
+    public Task<ResolvedAsset?> ResolveAsset(string assetId)
     {
         var path = AssetPath(assetId);
-        if (path is null || !Path.GetFullPath(path).StartsWith(Path.GetFullPath(UserRoot(userKey)))) return Task.FromResult<ResolvedAsset?>(null);
+        if (path is null || !Path.GetFullPath(path).StartsWith(Path.GetFullPath(dataRoot))) return Task.FromResult<ResolvedAsset?>(null);
         return Task.FromResult<ResolvedAsset?>(new ResolvedAsset(path, PixlForgeHelpers.ContentType(path)));
     }
 
